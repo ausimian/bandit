@@ -26,10 +26,11 @@ defmodule Bandit.HTTP1.HeadParser do
   # Adapted from Hotpot's HTTP/1 request-head parser
   # (https://github.com/ausimian/hotpot, MIT licensed).
 
-  # The scanning functions carry the whole parse state as arguments, so that
-  # every one starts with a binary match on `rest` and the head is parsed
-  # with a single match context; that is where the speed comes from.
-  # credo:disable-for-this-file Credo.Check.Refactor.FunctionArity
+  # The scanning functions carry the parse state as arguments, so that every
+  # one starts with a binary match on `rest` and the head is parsed with a
+  # single match context; that is where the speed comes from. What stays the
+  # same for the whole head (the buffer, the request line and the limits)
+  # rides along in one tuple, built once the request line is read.
 
   import Bitwise
 
@@ -169,7 +170,7 @@ defmodule Bandit.HTTP1.HeadParser do
   defp request_line(rest, buf, start, pos, m, version, {max_line, _, _} = limits)
        when pos + 11 + @margin <= max_line do
     req = {m, {nil, nil, nil, binary_part(buf, start, pos - start)}, version}
-    headers(rest, buf, pos + 11, req, [], 0, limits)
+    headers(rest, {buf, req, limits}, pos + 11, [], 0)
   end
 
   defp request_line(_, _, _, _, _, _, _), do: :fallback
@@ -186,73 +187,60 @@ defmodule Bandit.HTTP1.HeadParser do
 
   ## Headers
 
-  defp more(buf, line, {_, max_header, _}) do
+  defp more({buf, _, {_, max_header, _}}, line) do
     if byte_size(buf) - line + @margin <= max_header, do: :more, else: :fallback
   end
 
   for name <- @known_headers,
       canonical = name |> String.split("-") |> Enum.map_join("-", &String.capitalize/1),
       raw <- Enum.uniq([name, canonical | Map.get(@extra_spellings, name, [])]) do
-    defp headers(<<unquote(raw), ?:, rest::binary>>, buf, pos, req, acc, count, limits),
-      do:
-        value_ws(
-          rest,
-          buf,
-          pos,
-          pos + unquote(byte_size(raw) + 1),
-          unquote(name),
-          req,
-          acc,
-          count,
-          limits
-        )
+    defp headers(<<unquote(raw), ?:, rest::binary>>, head, pos, acc, count),
+      do: value_ws(rest, head, pos, pos + unquote(byte_size(raw) + 1), unquote(name), acc, count)
   end
 
-  defp headers(<<"\r\n", rest::binary>>, _buf, _pos, req, acc, _count, _limits),
+  defp headers(<<"\r\n", rest::binary>>, {_, req, _}, _pos, acc, _count),
     do: {:ok, req, :lists.reverse(acc), rest}
 
-  defp headers(<<c, rest::binary>>, buf, pos, req, acc, count, limits)
-       when is_lower(c) or is_tother(c),
-       do: name_lower(rest, buf, pos, pos + 1, req, acc, count, limits)
+  defp headers(<<c, rest::binary>>, head, pos, acc, count) when is_lower(c) or is_tother(c),
+    do: name_lower(rest, head, pos, pos + 1, acc, count)
 
-  defp headers(<<c, rest::binary>>, buf, pos, req, acc, count, limits) when is_upper(c),
-    do: name_mixed(rest, buf, pos, pos + 1, req, acc, count, limits)
+  defp headers(<<c, rest::binary>>, head, pos, acc, count) when is_upper(c),
+    do: name_mixed(rest, head, pos, pos + 1, acc, count)
 
-  defp headers(<<>>, buf, pos, _req, _acc, _count, limits), do: more(buf, pos, limits)
-  defp headers("\r", buf, pos, _req, _acc, _count, limits), do: more(buf, pos, limits)
-  defp headers(_, _, _, _, _, _, _), do: :fallback
+  defp headers(<<>>, head, pos, _acc, _count), do: more(head, pos)
+  defp headers("\r", head, pos, _acc, _count), do: more(head, pos)
+  defp headers(_, _, _, _, _), do: :fallback
 
   # The name scan tracks whether the raw name is already lowercase, so the
   # common case is a slice of the buffer with no second pass: name_lower has
   # seen no upper-case byte yet and name_mixed has.
 
-  defp name_lower(<<c, rest::binary>>, buf, start, pos, req, acc, count, limits)
+  defp name_lower(<<c, rest::binary>>, head, start, pos, acc, count)
        when is_lower(c) or is_tother(c),
-       do: name_lower(rest, buf, start, pos + 1, req, acc, count, limits)
+       do: name_lower(rest, head, start, pos + 1, acc, count)
 
-  defp name_lower(<<c, rest::binary>>, buf, start, pos, req, acc, count, limits)
-       when is_upper(c),
-       do: name_mixed(rest, buf, start, pos + 1, req, acc, count, limits)
+  defp name_lower(<<c, rest::binary>>, head, start, pos, acc, count) when is_upper(c),
+    do: name_mixed(rest, head, start, pos + 1, acc, count)
 
-  defp name_lower(<<?:, rest::binary>>, buf, start, pos, req, acc, count, limits) do
+  defp name_lower(<<?:, rest::binary>>, {buf, _, _} = head, start, pos, acc, count) do
     name = binary_part(buf, start, pos - start)
-    value_ws(rest, buf, start, pos + 1, name, req, acc, count, limits)
+    value_ws(rest, head, start, pos + 1, name, acc, count)
   end
 
-  defp name_lower(<<>>, buf, start, _, _req, _acc, _count, limits), do: more(buf, start, limits)
-  defp name_lower(_, _, _, _, _, _, _, _), do: :fallback
+  defp name_lower(<<>>, head, start, _, _acc, _count), do: more(head, start)
+  defp name_lower(_, _, _, _, _, _), do: :fallback
 
-  defp name_mixed(<<c, rest::binary>>, buf, start, pos, req, acc, count, limits)
+  defp name_mixed(<<c, rest::binary>>, head, start, pos, acc, count)
        when is_lower(c) or is_upper(c) or is_tother(c),
-       do: name_mixed(rest, buf, start, pos + 1, req, acc, count, limits)
+       do: name_mixed(rest, head, start, pos + 1, acc, count)
 
-  defp name_mixed(<<?:, rest::binary>>, buf, start, pos, req, acc, count, limits) do
+  defp name_mixed(<<?:, rest::binary>>, {buf, _, _} = head, start, pos, acc, count) do
     name = downcase(binary_part(buf, start, pos - start))
-    value_ws(rest, buf, start, pos + 1, name, req, acc, count, limits)
+    value_ws(rest, head, start, pos + 1, name, acc, count)
   end
 
-  defp name_mixed(<<>>, buf, start, _, _req, _acc, _count, limits), do: more(buf, start, limits)
-  defp name_mixed(_, _, _, _, _, _, _, _), do: :fallback
+  defp name_mixed(<<>>, head, start, _, _acc, _count), do: more(head, start)
+  defp name_mixed(_, _, _, _, _, _), do: :fallback
 
   # A charlist turned into a heap binary is about twice as fast as an
   # appending loop for names this short.
@@ -266,48 +254,46 @@ defmodule Bandit.HTTP1.HeadParser do
 
   # `line` is where the header line starts, for the length limit.
 
-  defp value_ws(<<c, rest::binary>>, buf, line, pos, name, req, acc, count, limits)
+  defp value_ws(<<c, rest::binary>>, head, line, pos, name, acc, count)
        when c == ?\s or c == ?\t,
-       do: value_ws(rest, buf, line, pos + 1, name, req, acc, count, limits)
+       do: value_ws(rest, head, line, pos + 1, name, acc, count)
 
-  defp value_ws(rest, buf, line, pos, name, req, acc, count, limits),
-    do: value(rest, buf, line, pos, pos, name, req, acc, count, limits)
+  defp value_ws(rest, head, line, pos, name, acc, count),
+    do: value(rest, head, line, pos, pos, name, acc, count)
 
   # Skip 7 bytes at a time while all are valid field-value bytes; the
   # byte-wise clauses handle HTAB, the line end and anything invalid.
-  defp value(<<x::56, rest::binary>>, buf, line, start, pos, name, req, acc, count, limits)
+  defp value(<<x::56, rest::binary>>, head, line, start, pos, name, acc, count)
        when all_vchar_or_sp(x),
-       do: value(rest, buf, line, start, pos + 7, name, req, acc, count, limits)
+       do: value(rest, head, line, start, pos + 7, name, acc, count)
 
-  defp value(<<c, rest::binary>>, buf, line, start, pos, name, req, acc, count, limits)
+  defp value(<<c, rest::binary>>, head, line, start, pos, name, acc, count)
        when c == ?\t or (c >= 0x20 and c != 0x7F),
-       do: value(rest, buf, line, start, pos + 1, name, req, acc, count, limits)
+       do: value(rest, head, line, start, pos + 1, name, acc, count)
 
   # obs-fold continuation line
-  defp value(<<"\r\n", c, _::binary>>, _, _, _, _, _, _, _, _, _) when c == ?\s or c == ?\t,
+  defp value(<<"\r\n", c, _::binary>>, _, _, _, _, _, _, _) when c == ?\s or c == ?\t,
     do: :fallback
 
   # The header is not complete until the next byte rules out obs-fold.
-  defp value("\r\n", buf, line, _, _, _, _req, _acc, _count, limits), do: more(buf, line, limits)
+  defp value("\r\n", head, line, _, _, _, _acc, _count), do: more(head, line)
 
   defp value(
          <<"\r\n", rest::binary>>,
-         buf,
+         {buf, _, {_, max_header, max_count}} = head,
          line,
          start,
          pos,
          name,
-         req,
          acc,
-         count,
-         {_, max_header, max_count} = limits
+         count
        )
        when pos - line + 2 + @margin <= max_header and count < max_count do
     h = {name, binary_part(buf, start, pos - start)}
-    headers(rest, buf, pos + 2, req, [h | acc], count + 1, limits)
+    headers(rest, head, pos + 2, [h | acc], count + 1)
   end
 
-  defp value(<<>>, buf, line, _, _, _, _req, _acc, _count, limits), do: more(buf, line, limits)
-  defp value("\r", buf, line, _, _, _, _req, _acc, _count, limits), do: more(buf, line, limits)
-  defp value(_, _, _, _, _, _, _, _, _, _), do: :fallback
+  defp value(<<>>, head, line, _, _, _, _acc, _count), do: more(head, line)
+  defp value("\r", head, line, _, _, _, _acc, _count), do: more(head, line)
+  defp value(_, _, _, _, _, _, _, _), do: :fallback
 end
