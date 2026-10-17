@@ -26,10 +26,8 @@ defmodule Bandit.HTTP1.HeadParser do
   # Adapted from Hotpot's HTTP/1 request-head parser
   # (https://github.com/ausimian/hotpot, MIT licensed).
 
-  # The scanning functions carry the whole parse state as arguments, so that
-  # every one starts with a binary match on `rest` and the head is parsed
-  # with a single match context; that is where the speed comes from.
-  # credo:disable-for-this-file Credo.Check.Refactor.FunctionArity
+  # Every scanning function starts with a binary match on `rest`, so the head
+  # is parsed with a single match context; that is where the speed comes from.
 
   import Bitwise
 
@@ -197,14 +195,8 @@ defmodule Bandit.HTTP1.HeadParser do
       do:
         value_ws(
           rest,
-          buf,
-          pos,
           pos + unquote(byte_size(raw) + 1),
-          unquote(name),
-          req,
-          acc,
-          count,
-          limits
+          {buf, pos, unquote(name), req, acc, count, limits}
         )
   end
 
@@ -236,7 +228,7 @@ defmodule Bandit.HTTP1.HeadParser do
 
   defp name_lower(<<?:, rest::binary>>, buf, start, pos, req, acc, count, limits) do
     name = binary_part(buf, start, pos - start)
-    value_ws(rest, buf, start, pos + 1, name, req, acc, count, limits)
+    value_ws(rest, pos + 1, {buf, start, name, req, acc, count, limits})
   end
 
   defp name_lower(<<>>, buf, start, _, _req, _acc, _count, limits), do: more(buf, start, limits)
@@ -248,7 +240,7 @@ defmodule Bandit.HTTP1.HeadParser do
 
   defp name_mixed(<<?:, rest::binary>>, buf, start, pos, req, acc, count, limits) do
     name = downcase(binary_part(buf, start, pos - start))
-    value_ws(rest, buf, start, pos + 1, name, req, acc, count, limits)
+    value_ws(rest, pos + 1, {buf, start, name, req, acc, count, limits})
   end
 
   defp name_mixed(<<>>, buf, start, _, _req, _acc, _count, limits), do: more(buf, start, limits)
@@ -264,50 +256,43 @@ defmodule Bandit.HTTP1.HeadParser do
 
   ## Values
 
-  # `line` is where the header line starts, for the length limit.
+  # A field value is scanned with only its position moving, so the rest of the
+  # parse state rides along in one tuple, built once per header: the buffer,
+  # where the header line starts (for the length limit), the field name, and
+  # the request line, headers and count so far, with the limits.
 
-  defp value_ws(<<c, rest::binary>>, buf, line, pos, name, req, acc, count, limits)
-       when c == ?\s or c == ?\t,
-       do: value_ws(rest, buf, line, pos + 1, name, req, acc, count, limits)
+  defp value_ws(<<c, rest::binary>>, pos, header) when c == ?\s or c == ?\t,
+    do: value_ws(rest, pos + 1, header)
 
-  defp value_ws(rest, buf, line, pos, name, req, acc, count, limits),
-    do: value(rest, buf, line, pos, pos, name, req, acc, count, limits)
+  defp value_ws(rest, pos, header), do: value(rest, pos, pos, header)
 
   # Skip 7 bytes at a time while all are valid field-value bytes; the
   # byte-wise clauses handle HTAB, the line end and anything invalid.
-  defp value(<<x::56, rest::binary>>, buf, line, start, pos, name, req, acc, count, limits)
-       when all_vchar_or_sp(x),
-       do: value(rest, buf, line, start, pos + 7, name, req, acc, count, limits)
+  defp value(<<x::56, rest::binary>>, start, pos, header) when all_vchar_or_sp(x),
+    do: value(rest, start, pos + 7, header)
 
-  defp value(<<c, rest::binary>>, buf, line, start, pos, name, req, acc, count, limits)
+  defp value(<<c, rest::binary>>, start, pos, header)
        when c == ?\t or (c >= 0x20 and c != 0x7F),
-       do: value(rest, buf, line, start, pos + 1, name, req, acc, count, limits)
+       do: value(rest, start, pos + 1, header)
 
   # obs-fold continuation line
-  defp value(<<"\r\n", c, _::binary>>, _, _, _, _, _, _, _, _, _) when c == ?\s or c == ?\t,
-    do: :fallback
+  defp value(<<"\r\n", c, _::binary>>, _, _, _) when c == ?\s or c == ?\t, do: :fallback
 
   # The header is not complete until the next byte rules out obs-fold.
-  defp value("\r\n", buf, line, _, _, _, _req, _acc, _count, limits), do: more(buf, line, limits)
+  defp value("\r\n", _, _, {buf, line, _, _, _, _, limits}), do: more(buf, line, limits)
 
   defp value(
          <<"\r\n", rest::binary>>,
-         buf,
-         line,
          start,
          pos,
-         name,
-         req,
-         acc,
-         count,
-         {_, max_header, max_count} = limits
+         {buf, line, name, req, acc, count, {_, max_header, max_count} = limits}
        )
        when pos - line + 2 + @margin <= max_header and count < max_count do
     h = {name, binary_part(buf, start, pos - start)}
     headers(rest, buf, pos + 2, req, [h | acc], count + 1, limits)
   end
 
-  defp value(<<>>, buf, line, _, _, _, _req, _acc, _count, limits), do: more(buf, line, limits)
-  defp value("\r", buf, line, _, _, _, _req, _acc, _count, limits), do: more(buf, line, limits)
-  defp value(_, _, _, _, _, _, _, _, _, _), do: :fallback
+  defp value(<<>>, _, _, {buf, line, _, _, _, _, limits}), do: more(buf, line, limits)
+  defp value("\r", _, _, {buf, line, _, _, _, _, limits}), do: more(buf, line, limits)
+  defp value(_, _, _, _), do: :fallback
 end
